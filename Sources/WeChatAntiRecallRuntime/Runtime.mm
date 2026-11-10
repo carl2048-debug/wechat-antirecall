@@ -11,6 +11,7 @@
 #include <os/log.h>
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -23,8 +24,17 @@
 #include "RecallLogInternal.h"
 #include "RedPacketInternal.h"
 #include "WindowPrivacyInternal.h"
+#include "NativeFeatures.h"
+#include "MessageProbe.h"
 
 namespace {
+
+int dynamicHookStatus = 0;
+
+bool dynamicInjectionEnabled() {
+    const char *value = std::getenv("WECHAT_ANTIRECALL_DYNAMIC");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
 
 constexpr NSUInteger revokeTipMaximumLength = 120;
 constexpr size_t revokeTimeCacheMaximumCount = 512;
@@ -1763,6 +1773,11 @@ bool hookedParseRevokeXML(void *message, std::string *xml, void *flag) {
         // Opt-in recall log. Best effort and independent of the tip rewrite below.
         recall_log::record(*xml, originalReplaceMsg, hasContentPreview ? &contentPreview : nullptr);
 
+        if (wechat_antirecall_native_silent()) {
+            *newMsgId = 0;
+            replaceMsg->clear();
+            return result;
+        }
         const char *phrase = [configuredPhrase() UTF8String];
         if (phrase != nullptr) {
             *newMsgId = 0;
@@ -1838,7 +1853,7 @@ bool writeHookSlot(void **slot, void *replacement) {
         return false;
     }
 
-    *slot = replacement;
+    __atomic_store_n(slot, replacement, __ATOMIC_RELEASE);
     const bool wroteReplacement = *slot == replacement;
     if (!wroteReplacement) {
         *slot = originalValue;
@@ -2095,9 +2110,91 @@ void installMessageCaptureInlineHook(
     }
 }
 
+// Called synchronously by dyld before WeChat's initializers. No file-backed mapping
+// is written: VM_PROT_COPY creates a private code page in this process only.
+// Publish the original trampoline before making the entry reachable.
+template <typename Function>
+bool installDynamicEntry(const WeChatDylibImage &image, uintptr_t offset,
+                         const uint32_t saved[3], void *replacement,
+                         Function *original) {
+    const uintptr_t entry = image.slide + offset;
+    if (!rangeContains(image.start, image.size, entry, 12) ||
+        !isAddressRangeReadable(reinterpret_cast<void *>(entry), 12) ||
+        std::memcmp(reinterpret_cast<void *>(entry), saved, 12) != 0) {
+        return false; // Wrong build or a pre-existing static patch.
+    }
+    const size_t pageSize = static_cast<size_t>(getpagesize());
+    void *slot = mmap(reinterpret_cast<void *>(image.start + image.size + pageSize),
+                      pageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (slot == MAP_FAILED) return false;
+    uint32_t stub[3];
+    if (!encodeEntryStub(entry, reinterpret_cast<uintptr_t>(slot), stub)) {
+        munmap(slot, pageSize);
+        return false;
+    }
+    size_t trampolineSize = 0;
+    void *trampoline = buildInlineTrampoline(saved, entry + 12, trampolineSize);
+    if (trampoline == nullptr) {
+        munmap(slot, pageSize);
+        return false;
+    }
+    *reinterpret_cast<void **>(slot) = replacement;
+    *original = reinterpret_cast<Function>(trampoline);
+    const mach_vm_address_t page = entry & ~(uintptr_t(pageSize) - 1);
+    const mach_vm_size_t length = ((entry + 12 - page + pageSize - 1) / pageSize) * pageSize;
+    if (mach_vm_protect(mach_task_self(), page, length, false,
+                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+        *original = nullptr;
+        munmap(trampoline, trampolineSize);
+        munmap(slot, pageSize);
+        return false;
+    }
+    std::memcpy(reinterpret_cast<void *>(entry), stub, sizeof(stub));
+    // An executable mapping must never be resumed with the wrong permissions.
+    if (mach_vm_protect(mach_task_self(), page, length, false,
+                        VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
+        std::abort();
+    }
+    sys_icache_invalidate(reinterpret_cast<void *>(entry), sizeof(stub));
+    return true; // Slot and trampoline deliberately live until process exit.
+}
+
+void installDynamicHooks(const WeChatDylibImage &image, const char *build) {
+    dynamicHookStatus = -1;
+    if (const auto *stub = revokeHookConfigForBuild(build)) {
+        installRevokeTipStubHook(image, stub);
+        dynamicHookStatus = originalParseRevokeXML != nullptr ? 1 : -1;
+        return;
+    }
+    const auto *config = inlineRevokeHookConfigForBuild(build);
+    if (config == nullptr) return;
+    activeInlineRevokeHookConfig = RevokeHookConfig{
+        config->buildVersion, config->entryOffset, config->newMsgIdOffset, config->replaceMsgOffset
+    };
+    activeRevokeHookConfig = &activeInlineRevokeHookConfig;
+    // installDynamicEntry publishes the original through the real global before
+    // patching the entry, so the hook is safe as soon as dyld resumes execution.
+    if (!installDynamicEntry(image, config->entryOffset, config->savedInstructions,
+                             reinterpret_cast<void *>(&hookedParseRevokeXML), &originalParseRevokeXML)) {
+        activeRevokeHookConfig = nullptr;
+        return;
+    }
+    if (const auto *capture = inlineMessageCaptureHookConfigForBuild(build)) {
+        activeMessageCaptureHookConfig = capture;
+        if (!installDynamicEntry(image, capture->entryOffset, capture->savedInstructions,
+                                 reinterpret_cast<void *>(&hookedFinalizeMessage), &originalFinalizeMessage)) return;
+        wechat_antirecall_red_packet_initialize(image.slide, build);
+    }
+    dynamicHookStatus = 1;
+}
+
 void installRevokeTipHook(const WeChatDylibImage &image) {
 
     const std::string buildVersion = currentBundleBuildVersion();
+    if (dynamicInjectionEnabled()) {
+        installDynamicHooks(image, buildVersion.c_str());
+        return;
+    }
     if (const auto *config = revokeHookConfigForBuild(buildVersion.c_str())) {
         installRevokeTipStubHook(image, config);
     } else if (const auto *inlineConfig = inlineRevokeHookConfigForBuild(buildVersion.c_str())) {
@@ -2136,6 +2233,270 @@ void wechatImageAdded(const mach_header *header, intptr_t slide) {
 }
 
 } // namespace
+
+int wechat_antirecall_dynamic_hook_status(void) {
+    return dynamicHookStatus;
+}
+
+namespace {
+struct NativePatchRecord { uint64_t entry; uint32_t expected, branch; };
+struct NativePatchPlan { uint32_t version = 1, count = 0; NativePatchRecord records[2] = {}; };
+static_assert(sizeof(NativePatchPlan) == 40, "native patch IPC ABI");
+NativePatchPlan nativePatchPlan;
+char nativePatchError[512] = {};
+
+// Prepare code and original-function pointers in the target. The controller
+// performs the actual entry writes while every target thread is suspended.
+template <typename Function>
+bool installNativeAtomicBranch(const WeChatDylibImage &image, uintptr_t offset,
+                               uint32_t expected, void *replacement, Function *original) {
+    if (*original != nullptr) return true;
+    const uintptr_t entry = image.slide + offset;
+    if ((entry & 3) || !rangeContains(image.start, image.size, entry, 4) ||
+        !isAddressRangeReadable(reinterpret_cast<void *>(entry), 4) ||
+        *reinterpret_cast<const uint32_t *>(entry) != expected) {
+        std::snprintf(nativePatchError, sizeof(nativePatchError), "入口指令校验失败：0x%llx", (unsigned long long)entry);
+        return false;
+    }
+    const size_t pageSize = static_cast<size_t>(getpagesize());
+    mach_vm_address_t island = 0;
+    kern_return_t allocationResult = KERN_NO_SPACE;
+    const uintptr_t reach = uintptr_t(1) << 27;
+    uintptr_t cursor = entry > reach ? (entry - reach + pageSize - 1) & ~(uintptr_t(pageSize) - 1) : pageSize;
+    const uintptr_t limit = (entry + reach) & ~(uintptr_t(pageSize) - 1);
+    while (cursor < limit) {
+        mach_vm_address_t region = cursor;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info = {};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const kern_return_t regionResult = mach_vm_region(mach_task_self(), &region, &size,
+            VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (regionResult != KERN_SUCCESS || region >= cursor + pageSize) {
+            mach_vm_address_t candidate = cursor;
+            allocationResult = mach_vm_allocate(mach_task_self(), &candidate, pageSize, VM_FLAGS_FIXED);
+            if (allocationResult == KERN_SUCCESS) { island = candidate; break; }
+            cursor += pageSize;
+        } else {
+            if (region + size <= cursor) break;
+            cursor = (region + size + pageSize - 1) & ~(uintptr_t(pageSize) - 1);
+        }
+    }
+    if (!island) {
+        std::snprintf(nativePatchError, sizeof(nativePatchError), "近跳转页分配失败：entry=0x%llx，kr=%d", (unsigned long long)entry, allocationResult);
+        return false;
+    }
+    uint8_t code[40] = {};
+    const uint32_t words[] = {
+        0x58000050, 0xd61f0200, 0, 0, // ldr x16,#8; br x16; replacement
+        expected, 0x58000071, 0xd61f0220, 0xd503201f // original; ldr x17,#12; br x17; nop
+    };
+    std::memcpy(code, words, sizeof(words));
+    const uintptr_t destination = reinterpret_cast<uintptr_t>(replacement), continuation = entry + 4;
+    std::memcpy(code + 8, &destination, 8);
+    std::memcpy(code + 32, &continuation, 8);
+    std::memcpy(reinterpret_cast<void *>(island), code, sizeof(code));
+    sys_icache_invalidate(reinterpret_cast<void *>(island), sizeof(code));
+    const kern_return_t executableResult = mach_vm_protect(mach_task_self(), island, pageSize, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (executableResult != KERN_SUCCESS) {
+        std::snprintf(nativePatchError, sizeof(nativePatchError), "跳转页转 RX 失败：kr=%d", executableResult);
+        mach_vm_deallocate(mach_task_self(), island, pageSize);
+        return false;
+    }
+    if (nativePatchPlan.count >= 2) {
+        std::snprintf(nativePatchError, sizeof(nativePatchError), "入口写入计划超过上限");
+        mach_vm_deallocate(mach_task_self(), island, pageSize);
+        return false;
+    }
+    const int64_t delta = static_cast<int64_t>(island) - static_cast<int64_t>(entry);
+    const uint32_t branch = 0x14000000u | (static_cast<uint32_t>(delta >> 2) & 0x03ffffffu);
+    *original = reinterpret_cast<Function>(island + 16);
+    nativePatchPlan.records[nativePatchPlan.count++] = NativePatchRecord{entry, expected, branch};
+
+    return true; // Private branch island lives until WeChat exits.
+}
+
+int installNative270353(const mach_header *header, intptr_t slide) {
+    if (nativePatchPlan.count) {
+        for (uint32_t i = 0; i < nativePatchPlan.count; ++i) {
+            const auto &record = nativePatchPlan.records[i];
+            if (__atomic_load_n(reinterpret_cast<uint32_t *>(record.entry), __ATOMIC_ACQUIRE) != record.branch) return 2;
+            sys_icache_invalidate(reinterpret_cast<void *>(record.entry), 4);
+        }
+        const bool messageHook = originalFinalizeMessage != nullptr;
+        if (messageHook) wechat_antirecall_red_packet_initialize(slide, "270353");
+        wechat_antirecall_window_privacy_start();
+        wechat_antirecall_native_features_start(messageHook, wechat_antirecall_red_packet_available());
+        dynamicHookStatus = 1;
+        return 1;
+    }
+    uintptr_t start = 0; size_t size = 0;
+    if (!imageAddressRangeForHeader(header, slide, start, size)) return -12;
+    const WeChatDylibImage image{static_cast<uintptr_t>(slide), start, size};
+    const uintptr_t parser = slide + 0x4e7d194;
+    const uint32_t prefix[] = {0xa9bc5ff8, 0xa90157f6, 0xa9024ff4};
+    if (!rangeContains(start, size, parser, 0xA14) ||
+        !isAddressRangeReadable(reinterpret_cast<void *>(parser), 0xA14) ||
+        std::memcmp(reinterpret_cast<void *>(parser), prefix, sizeof(prefix)) ||
+        *reinterpret_cast<uint32_t *>(parser + 0x270) != 0x34001040 ||
+        *reinterpret_cast<uint32_t *>(parser + 0xA10) != 0xf900e660) return -13;
+    static const RevokeHookConfig revoke{"270353", 0x4e7d194, 0x1c8, 0x1d0};
+    static const InlineMessageCaptureHookConfig capture{
+        "270353", 0x4e19d4c, {0x39496008, 0x7100051f, 0x7a400820}, 0x4e19d58, 0xf8, 0xc, 0x130
+    };
+    const uintptr_t message = slide + capture.entryOffset;
+    const bool messageMatches = rangeContains(start, size, message, 12) &&
+        isAddressRangeReadable(reinterpret_cast<void *>(message), 12) &&
+        !std::memcmp(reinterpret_cast<void *>(message), capture.savedInstructions, 12);
+    activeRevokeHookConfig = &revoke;
+    if (!installNativeAtomicBranch(image, revoke.originalBody, prefix[0],
+            reinterpret_cast<void *>(&hookedParseRevokeXML), &originalParseRevokeXML)) {
+        activeRevokeHookConfig = nullptr;
+        return -17;
+    }
+    bool messageHook = false;
+    if (messageMatches) {
+        activeMessageCaptureHookConfig = &capture;
+        messageHook = installNativeAtomicBranch(image, capture.entryOffset, capture.savedInstructions[0],
+            reinterpret_cast<void *>(&hookedFinalizeMessage), &originalFinalizeMessage);
+        if (!messageHook) activeMessageCaptureHookConfig = nullptr;
+    }
+    dynamicHookStatus = 0;
+    return 2; // Controller must apply the prepared plan, then call us again.
+
+}
+
+bool installNativeMessageHook(const WeChatDylibImage &image) {
+    static const InlineMessageCaptureHookConfig config{
+        "268602", 0x4707934, {0x39488008, 0x7100051f, 0x7a400820},
+        0x4707940, 0xd0, 0xc, 0x120
+    };
+    const uintptr_t body = image.slide + config.entryOffset;
+    if (!rangeContains(image.start, image.size, body, 12) ||
+        !isAddressRangeReadable(reinterpret_cast<void *>(body), 12) ||
+        std::memcmp(reinterpret_cast<void *>(body), config.savedInstructions, 12)) return false;
+    const uintptr_t slot = resolveParseRevokeXMLHookSlot(body, image.start, image.size);
+    if (!slot || !message_probe::initializeNative268602(image.slide)) return false;
+    if (originalFinalizeMessage != nullptr) return true;
+    activeMessageCaptureHookConfig = &config;
+    originalFinalizeMessage = reinterpret_cast<FinalizeMessage>(body);
+    if (!writeHookSlot(reinterpret_cast<void **>(slot), reinterpret_cast<void *>(&hookedFinalizeMessage))) {
+        originalFinalizeMessage = nullptr;
+        activeMessageCaptureHookConfig = nullptr;
+        return false;
+    }
+    return true;
+}
+}
+
+const void *wechat_antirecall_native_patch_plan(void) { return &nativePatchPlan; }
+const char *wechat_antirecall_native_last_error(void) { return nativePatchError; }
+
+int wechat_antirecall_native_attach(void) {
+    // Running-process attachment is restricted to the verified dispatch-slot
+    // build. Never rewrite multi-instruction inline entries in a live process.
+    static std::mutex attachMutex;
+    std::lock_guard<std::mutex> lock(attachMutex);
+    @autoreleasepool {
+        const auto build = currentBundleBuildVersion();
+        if (build != "268602" && build != "270353") return -10;
+        // The installed 4.1.9.52 reports 268602 but its core differs from the
+        // historical catalog binary. Keep both candidates, and require the full
+        // known parser geometry and native dispatch stub before using either.
+        static const RevokeHookConfig installedConfig{"268602", 0x4764530, 0x168, 0x170};
+        const RevokeHookConfig *candidates[] = {
+            revokeHookConfigForBuild("268602"), &installedConfig
+        };
+        const uint32_t prefix[] = {0xA9BC5FF8, 0xA90157F6, 0xA9024FF4};
+        bool foundImage = false;
+        for (uint32_t i = 0, count = _dyld_image_count(); i < count; ++i) {
+            // Use dyld's image name directly; dladdr(header) need not resolve a
+            // symbol at the beginning of every loaded image.
+            if (!isTargetWeChatDylibPath(_dyld_get_image_name(i))) continue;
+            foundImage = true;
+            const mach_header *header = _dyld_get_image_header(i);
+            const intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            if (build == "270353") return installNative270353(header, slide);
+            uintptr_t start = 0;
+            size_t size = 0;
+            if (!header || header->cputype != CPU_TYPE_ARM64 ||
+                !imageAddressRangeForHeader(header, slide, start, size)) return -12;
+            const RevokeHookConfig *selected = nullptr;
+            for (const auto *candidate : candidates) {
+                if (!candidate) continue;
+                const uintptr_t body = slide + candidate->originalBody;
+                if (!rangeContains(start, size, body, 0xA08) ||
+                    !isAddressRangeReadable(reinterpret_cast<void *>(body), 0xA08)) continue;
+                uint32_t guard = 0, field = 0;
+                std::memcpy(&guard, reinterpret_cast<void *>(body + 0x270), sizeof(guard));
+                std::memcpy(&field, reinterpret_cast<void *>(body + 0xA04), sizeof(field));
+                if (std::memcmp(reinterpret_cast<void *>(body), prefix, sizeof(prefix)) != 0 ||
+                    guard != 0x34000FE0 || field != 0xF900B660 ||
+                    !resolveParseRevokeXMLHookSlot(body, start, size)) continue;
+                if (selected) return -16;
+                selected = candidate;
+            }
+            if (!selected) return -13;
+            installRevokeTipStubHook({static_cast<uintptr_t>(slide), start, size}, selected);
+            dynamicHookStatus = originalParseRevokeXML != nullptr ? 1 : -14;
+            if (dynamicHookStatus == 1) {
+                const bool messageHook = installNativeMessageHook({static_cast<uintptr_t>(slide), start, size});
+                if (messageHook) wechat_antirecall_red_packet_initialize(slide, "268602");
+                wechat_antirecall_window_privacy_start();
+                wechat_antirecall_native_features_start(messageHook, wechat_antirecall_red_packet_available());
+            }
+            return dynamicHookStatus;
+        }
+        return foundImage ? -12 : -11;
+    }
+}
+
+namespace {
+using DynamicTestFunction = int (*)();
+DynamicTestFunction dynamicTestOriginal = nullptr;
+int dynamicTestReplacement() { return dynamicTestOriginal() + 1; }
+}
+
+int wechat_antirecall_dynamic_hook_selftest(void) {
+#if defined(__aarch64__)
+    FILE *file = std::tmpfile();
+    if (file == nullptr) return 0;
+    const size_t size = static_cast<size_t>(getpagesize());
+    const uint32_t words[] = {0x528000e0, 0xd503201f, 0xd503201f, 0xd65f03c0};
+    if (ftruncate(fileno(file), size) != 0 ||
+        pwrite(fileno(file), words, sizeof(words), 0) != sizeof(words)) {
+        fclose(file);
+        return 0;
+    }
+    void *code = mmap(nullptr, size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fileno(file), 0);
+    if (code == MAP_FAILED) { fclose(file); return 0; }
+    const uintptr_t address = reinterpret_cast<uintptr_t>(code);
+    const WeChatDylibImage image{address, address, size};
+    uint32_t wrong[] = {0, 0, 0};
+    const bool rejected = !installDynamicEntry(image, 0, wrong,
+        reinterpret_cast<void *>(&dynamicTestReplacement), &dynamicTestOriginal);
+    const bool installed = installDynamicEntry(image, 0, words,
+        reinterpret_cast<void *>(&dynamicTestReplacement), &dynamicTestOriginal);
+    bool passed = false;
+    if (installed) {
+        uint32_t disk[4] = {};
+        passed = rejected && reinterpret_cast<DynamicTestFunction>(code)() == 8 &&
+            dynamicTestOriginal() == 7 &&
+            pread(fileno(file), disk, sizeof(disk), 0) == sizeof(disk) &&
+            std::memcmp(disk, words, sizeof(words)) == 0;
+        const uintptr_t slot = decodeEntryStubSlot(reinterpret_cast<uint32_t *>(code), address);
+        munmap(reinterpret_cast<void *>(slot), size);
+        munmap(reinterpret_cast<void *>(dynamicTestOriginal), size);
+        dynamicTestOriginal = nullptr;
+    }
+    munmap(code, size);
+    fclose(file);
+    return passed ? 1 : 0;
+#else
+    return 0;
+#endif
+}
 
 char *wechat_antirecall_render_revoke_tip_copy(const char *originalTip, const char *configuredPhrase) {
     const std::string original = originalTip == nullptr ? "" : originalTip;

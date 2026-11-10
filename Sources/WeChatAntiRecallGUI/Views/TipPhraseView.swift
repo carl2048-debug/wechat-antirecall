@@ -15,7 +15,7 @@ struct TipPhraseView: View {
                 BannerView(banner: banner)
             }
 
-            availabilityNotice
+            if !state.isNativeBuild { availabilityNotice }
 
             if targetReadyForPreferences {
                 if let loadError = controller.loadError {
@@ -104,7 +104,7 @@ struct TipPhraseView: View {
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
-                Text("说明：构建号 269340、269341、269574、269575、269576、269577、269578、269579、269619、269624、269628、270090、270100、270102、270132、270133、270135 会显示本次启动后缓存的文字或媒体类型；其他构建、冷缓存、已淘汰或 ID 缺失的消息会省略。")
+                Text("说明：原生注入新版组件后可缓存新收到的文字或媒体类型。注入前收到、缓存已淘汰或 ID 缺失的消息会省略内容；不会读取历史数据库来补齐。")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -148,7 +148,7 @@ struct TipPhraseView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .tint(Theme.accent)
-                .disabled(controller.busy || state.busy || !state.customTipAvailable || (state.wechatRunning && !customTipInstalled))
+                .disabled(controller.busy || state.busy || !state.customTipAvailable || (!state.isNativeBuild && state.wechatRunning && !customTipInstalled))
             }
         }
     }
@@ -243,6 +243,7 @@ struct TipPhraseView: View {
     }
 
     private var targetReadyForPreferences: Bool {
+        if state.isNativeBuild { return true }
         switch state.supportStatus {
         case .supported, .unsupported:
             return true
@@ -259,10 +260,10 @@ struct TipPhraseView: View {
     }
     private var editorHintText: String {
         if customTipInstalled {
-            return "运行时已安装；保存后完全退出并重开微信即可生效。"
+            return "运行组件已加载；保存后新收到的撤回会使用新短语。"
         }
         if state.customTipAvailable {
-            return "可在下方一次完成「保存短语 + 安装运行时」，无需再跳到高级安装。"
+            return "可在下方保存短语并加载运行组件。当前版本使用动态注入。"
         }
         if state.customTipRuntimeOutdated {
             return "短语会正常保存；更新本应用或从最新源码构建运行组件后，即可安装自定义提示。"
@@ -272,7 +273,7 @@ struct TipPhraseView: View {
 
 
     private var customTipInstalled: Bool {
-        state.installState == .installed && state.installedMode == .customTip
+        state.nativeRuntimeActive || (state.installState == .installed && state.installedMode == .customTip)
     }
 
     private func saveAndApply() async {
@@ -281,9 +282,10 @@ struct TipPhraseView: View {
             state.banner = Banner(
                 kind: .success,
                 title: "自定义提示已保存",
-                message: "请完全退出并重开微信，新短语即可生效。")
+                message: "已保存。新收到的撤回会使用新短语。")
         } else {
-            await state.install(InstallRequest(mode: .customTip))
+            if state.isNativeBuild { await state.launchDynamically() }
+            else { await state.install(InstallRequest(mode: .customTip)) }
         }
     }
 }

@@ -12,6 +12,18 @@ struct RestoreView: View {
                 BannerView(banner: banner)
             }
 
+            if state.isNativeBuild {
+                Card {
+                    VStack(alignment: .leading, spacing: 8) {
+                        SectionLabel(text: "停用动态注入")
+                        Text("当前动态模式没有修改微信 App。完全退出微信即可停用本次注入；偏好设置会保留，下次直接打开微信不会自动注入。下方备份仅用于恢复以前安装的静态补丁。")
+                            .font(.callout).foregroundStyle(.secondary)
+                        Button("退出微信并停用本次注入") { Task { await state.quitWeChat() } }
+                            .disabled(state.busy || !state.wechatRunning)
+                    }
+                }
+            }
+
             Card {
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(text: "从备份还原")

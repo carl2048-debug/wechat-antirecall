@@ -13,11 +13,13 @@ let package = Package(
         .library(name: "WeChatAntiRecallRuntime", type: .dynamic, targets: ["WeChatAntiRecallRuntime"])
     ],
     targets: [
-        .executableTarget(name: "WeChatAntiRecall"),
+        .executableTarget(name: "WeChatAntiRecall", dependencies: ["WeChatNativeInjector", "WeChatRuntimeSession"]),
+        .target(name: "WeChatNativeInjector"),
+        .target(name: "WeChatRuntimeSession", dependencies: ["WeChatNativeInjector"]),
         // SwiftUI GUI shell. It shells out to the prebuilt `wechat-antirecall` CLI (bundled
         // in the .app's Resources), so it has NO dependency on the CLI target. Packaged into
         // a proper .app bundle by Scripts/make-app.sh.
-        .executableTarget(name: "WeChatAntiRecallGUI"),
+        .executableTarget(name: "WeChatAntiRecallGUI", dependencies: ["WeChatRuntimeSession"]),
         .target(
             name: "WeChatAntiRecallRuntime",
             // Runtime.mm is Objective-C++ using constexpr/auto/using. Without an explicit

@@ -6,7 +6,7 @@ struct RedPacketView: View {
     @StateObject private var controller = RedPacketController()
 
     private var runtimeInstalled: Bool {
-        controller.runtimeAvailable && state.installedMode == .customTip && state.installState == .installed
+        controller.runtimeAvailable && (state.nativeRuntimeActive || (state.installedMode == .customTip && state.installState == .installed))
     }
 
     private var modeDescription: String {
@@ -45,21 +45,22 @@ struct RedPacketView: View {
             Card {
                 VStack(alignment: .leading, spacing: 12) {
                     SectionLabel(text: "当前支持")
-                    Text("微信 4.1.13（269624 / 269628）及 4.1.15（270090 / 270100 / 270102 / 270132 / 270133 / 270135）")
-                    Text("用户已在微信 4.1.15.10（270090）实测确认普通红包自动领取可用。270100、270102、270132、270133、270135 已完成静态地址核对，领取结果仍以微信显示为准。")
+                    Text("微信 4.2.0（270353）、4.1.9（268602）、4.1.13（269624 / 269628）及 4.1.15（270090 / 270100 / 270102 / 270132 / 270133 / 270135）")
+                    Text("268602、270353 已接入各自版本的消息、服务、返回对象和九处指纹校验，尚未实测领取。功能默认关闭，领取结果以微信显示为准。")
                         .font(.callout).foregroundStyle(.secondary)
                     if controller.supported && !runtimeInstalled {
-                        Text("需要更新本工具的运行组件，并使用自定义撤回提示模式。安装前请完全退出微信。")
+                        Text("需要先加载运行组件。当前原生注入版本请回首页注入，无需修改微信 App。")
                             .font(.callout).foregroundStyle(.secondary)
                         Button(controller.runtimeAvailable ? "安装运行组件" : "安装或更新运行组件") {
                             Task {
-                                await state.install(InstallRequest(mode: .customTip), refreshRuntime: true)
+                                if state.isNativeBuild { await state.launchDynamically() }
+                            else { await state.install(InstallRequest(mode: .customTip), refreshRuntime: true) }
                                 await controller.load(appPath: state.appPath)
                             }
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(state.busy || controller.busy || state.wechatRunning || !state.customTipAvailable)
-                        if state.wechatRunning {
+                        .disabled(state.busy || controller.busy || (!state.isNativeBuild && (state.wechatRunning || !state.customTipAvailable)))
+                        if state.wechatRunning && !state.isNativeBuild {
                             Button("退出微信") { Task { await state.quitWeChat() } }.disabled(state.busy)
                         }
                     } else if !controller.supported && !controller.busy && controller.error == nil {

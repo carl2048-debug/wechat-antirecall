@@ -7,6 +7,14 @@
 extern "C" {
 #endif
 
+// Dynamic launch: 0 = core not loaded, 1 = hooks installed, -1 = install failed.
+int wechat_antirecall_dynamic_hook_status(void);
+// Native injector calls this on a real pthread after dlopen (build 268602 only).
+int wechat_antirecall_native_attach(void);
+const void *wechat_antirecall_native_patch_plan(void);
+const char *wechat_antirecall_native_last_error(void);
+int wechat_antirecall_dynamic_hook_selftest(void);
+
 char *wechat_antirecall_render_revoke_tip_copy(const char *originalTip, const char *configuredPhrase);
 char *wechat_antirecall_render_revoke_tip_for_event_copy(
     const char *originalTip,

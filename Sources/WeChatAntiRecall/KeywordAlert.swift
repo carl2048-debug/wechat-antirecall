@@ -10,7 +10,7 @@ struct KeywordAlertSettings: Codable, Equatable {
     static let maximumKeywordLength = 32
     // The alert reads the same verified Message layout as the red-packet feature, so it is
     // available on exactly those builds.
-    static var supportedBuilds: Set<String> { RedPacketSettings.supportedBuilds }
+    static var supportedBuilds: Set<String> { RedPacketSettings.supportedBuilds.union(["268602"]) }
 
     var enabled = false
     var keywords: [String] = []

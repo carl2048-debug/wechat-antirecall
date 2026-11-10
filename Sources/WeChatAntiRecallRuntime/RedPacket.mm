@@ -296,6 +296,40 @@ struct Profile {
 
 constexpr Profile kProfiles[] = {
     {
+        "270353", 0x17000, 0x72ad918,
+        0x4e1d5d0, 0x39a888, 0x47990b4, 0x469db2c,
+        0x454ba6c, 0x454ba74, 0x4f86c0,
+        0x9d5aa18, 0x9d5f800, 0x9fccca8, 0x9fccd28, 0xa000348,
+        {
+            {0x4e1d5d0, {0xd101c3ff, 0xa9035ff8, 0xa90457f6}},
+            {0x39a888, {0xa9be4ff4, 0xa9017bfd, 0x910043fd}},
+            {0x47990b4, {0x9002f108, 0xf9453500, 0xd65f03c0}},
+            {0x469db2c, {0xd107c3ff, 0xa91a67fa, 0xa91b5ff8}},
+            {0x454ba6c, {0xf9401c00, 0x17ff8599, 0xf9401c00}},
+            {0x454ba74, {0xf9401c00, 0x17ff868d, 0xf9401c00}},
+            {0x4f86c0, {0xd10303ff, 0xa9085ff8, 0xa90957f6}},
+            {0x4544588, {0xa9bc6ffc, 0xa90157f6, 0xa9024ff4}},
+            {0x4544d88, {0xd10503ff, 0xa90f67fa, 0xa9105ff8}},
+        },
+    },
+    {
+        "268602", 0x14000, 0x61d5518,
+        0x470ab60, 0x2d130c, 0x411d634, 0x391a73c,
+        0x37fbc4c, 0x37fbc64, 0x3fb92c,
+        0x8aacaa0, 0x8ab0cc8, 0x8cb2e00, 0x8cb2e80, 0x8d2b440,
+        {
+            {0x470ab70, {0xd10143ff, 0xa90257f6, 0xa9034ff4}},
+            {0x2d130c, {0xa9be4ff4, 0xa9017bfd, 0x910043fd}},
+            {0x411d644, {0xd0028b68, 0xf945dd00, 0xd65f03c0}},
+            {0x391a74c, {0xd107c3ff, 0xa91a67fa, 0xa91b5ff8}},
+            {0x37fbc5c, {0xf9401c00, 0x17ff8227, 0xb002d0c9}},
+            {0x37fbc74, {0xf9401c00, 0x17ff8325, 0xb002d0c9}},
+            {0x3fb92c, {0xd10303ff, 0xa9085ff8, 0xa90957f6}},
+            {0x37f44e8, {0xa9bc6ffc, 0xa90157f6, 0xa9024ff4}},
+            {0x37f4cd0, {0xd10543ff, 0xa90f6ffc, 0xa91067fa}},
+        },
+    },
+    {
         "269624", 0x19000, 0x6d8f06c,
         0x494e760, 0x38bc54, 0x4316f84, 0x421e59c,
         0x40dd2cc, 0x40dd2d4, 0x4ddea0,
@@ -650,15 +684,16 @@ void wechat_antirecall_red_packet_observe(void *message, int mode) {
 #if defined(__arm64__)
     using namespace red_packet;
     Api *api = activeApi.load();
-    if (!api || !enabled.load() || mode != 1 || !readable(message, 632) ||
-        field<uintptr_t>(message, 0) != api->at(api->profile->messageVtable) || field<uint32_t>(message, 12) != 49) return;
-    const auto created = field<uint32_t>(message, 276);
+    if (!api || !enabled.load()) return;
+    message_probe::Received received;
+    if (!message_probe::readReceived(message, mode, received) || received.type != 49) return;
+    const auto created = received.created;
     if (!fresh(created, activated.load(), static_cast<uint64_t>(std::time(nullptr)))) return;
     bool reserved = false;
     try {
-        auto raw = readString(static_cast<uint8_t *>(message) + 304);
-        auto from = readString(static_cast<uint8_t *>(message) + 24, 256);
-        auto to = readString(static_cast<uint8_t *>(message) + 48, 256);
+        auto raw = std::optional<std::string>(std::move(received.content));
+        auto from = std::optional<std::string>(std::move(received.from));
+        auto to = std::optional<std::string>(std::move(received.to));
         if (!raw || !from || !to) return;
         auto packet = parse(*raw);
         if (!packet) return;
@@ -713,9 +748,35 @@ void wechat_antirecall_red_packet_observe(void *message, int mode) {
 
 namespace message_probe {
 
+static std::atomic<uintptr_t> nativeSlide{0};
+
+bool initializeNative268602(uintptr_t slide) {
+    const uint32_t getter[] = {0xd0028b68, 0xf945dd00, 0xd65f03c0};
+    const uint32_t constructor[] = {0xf9402ac8, 0xf9006a68, 0xf94012c8};
+    for (const auto &check : {std::pair<uintptr_t, const uint32_t *>{0x411d644, getter},
+                              {0x4706778, constructor}}) {
+        const void *p = reinterpret_cast<void *>(slide + check.first);
+        if (!red_packet::readable(p, 12) || std::memcmp(p, check.second, 12)) return false;
+    }
+    nativeSlide.store(slide);
+    return true;
+}
+
 bool readReceived(void *message, int mode, Received &out) {
 #if defined(__arm64__)
     using namespace red_packet;
+    if (uintptr_t slide = nativeSlide.load()) {
+        if (mode != 1 || !readable(message, 0x240) || field<uintptr_t>(message, 0) != slide + 0x8d2b440) return false;
+        auto from = readString(static_cast<uint8_t *>(message) + 0x18, 256);
+        auto to = readString(static_cast<uint8_t *>(message) + 0x30, 256);
+        auto content = readString(static_cast<uint8_t *>(message) + 0x120);
+        if (!from || !to || !content) return false;
+        out.type = field<uint32_t>(message, 0xc);
+        out.created = field<uint32_t>(message, 0xec);
+        out.serverId = field<uint64_t>(message, 0xd0);
+        out.from = std::move(*from); out.to = std::move(*to); out.content = std::move(*content);
+        return true;
+    }
     Api *api = activeApi.load();
     if (!api || mode != 1 || !readable(message, 632) ||
         field<uintptr_t>(message, 0) != api->at(api->profile->messageVtable)) return false;
@@ -737,6 +798,16 @@ bool readReceived(void *message, int mode, Received &out) {
 }
 
 std::string currentAccount() {
+    if (uintptr_t slide = nativeSlide.load()) {
+        void *ctx = reinterpret_cast<void *(*)()>(slide + 0x411d634)();
+        if (!red_packet::readable(ctx, sizeof(uintptr_t))) return {};
+        const auto table = red_packet::field<uintptr_t>(ctx, 0);
+        if (!red_packet::readable(reinterpret_cast<void *>(table + 40), sizeof(uintptr_t))) return {};
+        const auto method = *reinterpret_cast<uintptr_t *>(table + 40);
+        if (method < slide + 0x14000 || method >= slide + 0x61d5518) return {};
+        const void *name = reinterpret_cast<const void *(*)(void *)>(method)(ctx);
+        return red_packet::readString(name, 256).value_or("");
+    }
 #if defined(__arm64__)
     red_packet::Api *api = red_packet::activeApi.load();
     return api ? api->account() : std::string();
@@ -780,7 +851,15 @@ red_packet::Subscription fakePacketSubscribe(red_packet::NativeTask *task,
 
 extern "C" {
 const char *wechat_antirecall_red_packet_runtime_version(void) {
-    return "WeChatAntiRecallRedPacket:9";
+    return "WeChatAntiRecallRedPacket:11";
+}
+
+bool wechat_antirecall_red_packet_available(void) {
+#if defined(__arm64__)
+    return red_packet::activeApi.load() != nullptr;
+#else
+    return false;
+#endif
 }
 int wechat_antirecall_red_packet_parse(const char *xml) {
     return xml && red_packet::parse(xml).has_value();

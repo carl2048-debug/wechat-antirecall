@@ -16,6 +16,27 @@ struct HomeView: View {
 
             statusCard
 
+            if state.isNativeBuild {
+                Card {
+                    VStack(alignment: .leading, spacing: 12) {
+                        SectionLabel(text: "原生动态注入（实验性）")
+                        Text("将插件加载到当前微信进程，不修改微信 App 或签名。需要管理员授权及系统允许进程注入；退出微信后失效。微信未启动时会先打开微信。")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Button("注入微信 · 开启防撤回") {
+                            Task { await state.launchDynamically() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(state.busy)
+                        Text("设置位于下方及左侧功能页。当前版本不使用静态安装。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                NativeOptionsView()
+            }
+
+            if !state.isNativeBuild {
             switch state.supportStatus {
             case .supported:
                 if state.customTipNeedsRestore {
@@ -33,6 +54,7 @@ struct HomeView: View {
                 detectionFailedCard
             case .unknown:
                 Card { ProgressView().controlSize(.small) }
+            }
             }
         }
     }
@@ -107,6 +129,9 @@ struct HomeView: View {
     }
 
     private var supportPill: some View {
+        if state.isNativeBuild {
+            return AnyView(StatusPill(tone: .good, text: "支持原生注入", systemImage: "checkmark.seal.fill"))
+        }
         switch state.supportStatus {
         case .supported:
             return AnyView(StatusPill(tone: .good, text: "此版本受支持", systemImage: "checkmark.seal.fill"))

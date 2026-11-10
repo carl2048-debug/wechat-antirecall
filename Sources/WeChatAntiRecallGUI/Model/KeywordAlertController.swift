@@ -66,7 +66,7 @@ final class KeywordAlertController: ObservableObject {
         if newValue { arguments += draftKeywords.flatMap { ["--keyword", $0] } }
         await run(arguments, appPath: appPath, saving: true,
                   successMessage: newValue
-                    ? "已开启。新收到的文字消息命中关键词时会弹系统通知；安装或更新运行组件后，请完全退出并重新打开微信。"
+                    ? "已开启。新收到的文字消息命中关键词时会弹系统通知；更新运行组件后，请重新注入；普通设置保存后生效。"
                     : "已关闭关键词提醒。关键词仍然保留。")
     }
 

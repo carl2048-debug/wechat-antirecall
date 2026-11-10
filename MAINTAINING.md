@@ -352,3 +352,30 @@
 - 本地构建：`bash Scripts/make-app.sh`（默认 arm64；`ARCHS="arm64 x86_64"` 才做 universal，但 `Runtime.mm` 用了无 `#if __arm64__` 守卫的 arm64 专有 API，universal 可能硬编译失败——`ci.yml` 的 canary 就是验证这个）。
 - 发布：打 `v*` tag → `release.yml` 在 `macos-14` 构建 + `make-app.sh` + `hdiutil` 打 DMG + `gh release create`。默认 ad-hoc 签名（无付费证书），用户首次需右键→打开。有 Developer ID 时给 `make-app.sh` 传 `CODESIGN_ID` 并加公证步骤即可。
 - 更新地址烘焙在 `Sources/WeChatAntiRecallGUI/Services/UpdateService.swift` 的 `Upstream`（`fzlzjerry/wechat-antirecall`）。换仓库改这里。
+## 原生动态注入路径
+
+本机微信 4.1.9（用户报告版本 4.1.9.52）的构建号为 `268602`，但其核心库与历史构建表不同：历史配置入口为 `0x47856a0`，本机 arm64 切片的已核对入口为 `0x4764530`，派发桩在 `0x4764520`。本机核心库文件 SHA-256 为 `15dd82596340654fd143c4935a79b1412f300eefe77b91291d6a05eeb02558ff`。原生注入保留两组候选，使用前必须校验入口三条指令、`entry+0x270` 的撤回分支、`entry+0xA04` 的字段写入和可解码派发桩；不单凭构建号使用地址。字段偏移仍为 `0x168` / `0x170`。当前运行中注入只开放此构建，避免在多线程运行时改写较新构建的多指令入口。旧的静态补丁表未随此次原生注入修复更改，不能据此认为本机静态安装也已适配。
+
+- GUI 复用 `AppState.launchDynamically`，必要时以当前用户打开微信。`RuntimeStaging` 以 GUI 用户身份复制 runtime 到 `~/Library/Containers/com.tencent.xinWeChat/Data/Library/Caches/WeChatAntiRecallRuntime/`，使微信沙箱能读取插件；不会修改微信 App。再通过现有 `CLIRunner.runAdmin` 调用 `launch`。原生注入器静态链接进 CLI，打包不需要独立 helper 或 LLDB。
+- `DynamicLaunch.swift` 根据完整主程序路径选择唯一 PID，拒绝 renderer/helper 和多个主进程。`WeChatNativeInjector/Injector.c` 再次校验 PID 路径，通过 `task_for_pid` 获取控制端口，校验 arm64 架构、共享缓存 UUID、slide 和所用系统函数字节。
+- 若进程尚无 `CS_DEBUGGED` 状态，使用原生 `ptrace(PT_ATTACHEXC)` 临时附加，等待暂停并立即分离，再确认进程运行状态允许执行注入代码。不修改磁盘签名或系统策略；已有调试器控制的进程不重复附加。
+- 通过 Mach API 分配进程私有数据、引导代码和栈。`RemoteBootstrap.S` 先在独立 Mach 线程上调用 `pthread_create_from_mach_thread`；真正的 pthread 才调用 `dlopen`、`dlsym` 和 `wechat_antirecall_native_attach`，避免在没有 pthread TLS 的 Mach 线程上执行 Foundation/dyld。控制端在完成创建后终止自己创建的引导线程，释放该线程的栈，不终止微信。
+- runtime 复用撤回派发桩，用 release 原子写入 Hook 指针；原函数指针及字段配置先完成初始化。`wechat_antirecall_native_attach` 检查构建号和实际安装状态，返回 1 才向 GUI 报告成功；错误分为构建不符、核心库未发现、镜像异常、指令不匹配及指针写入失败。再次注入会复用已加载的 dylib 和 Hook。
+- worker 自行分离 pthread；每次注入的少量引导代码与结果内存保留到微信退出，避免结果写回后清理仍在执行的返回指令。超时不强杀微信、不卸载插件，也不释放可能仍被 worker 使用的内存，要求重启微信再试。
+- CLI 的此入口不调用静态 patch、Mach-O 加载命令注入、备份或签名逻辑。当前 GUI 隐藏 268602 的静态安装操作。消息终结器、消息布局、账户 getter 及支付服务已为本机核心库独立适配，详见 [268602 功能适配](Docs/native-268602.md)。
+
+构建 GUI：`bash Scripts/make-app.sh`，随后打开 `dist/WeChatAntiRecall.app`。终端入口：先以普通用户打开微信，再执行 `sudo bash Scripts/launch-dynamic.sh`。按用户要求不运行测试；编译成功不代表系统一定允许真实注入。
+
+### 268602 的附加动态功能
+
+- 消息终结器函数体为 `0x4707934`，使用其前置派发桩，只写指针。字段/vtable 与新版本不同，`MessageProbe` 单独配置旧版；不能照抄 +0xF8/+0x130。关键词与红包观察复用该读取器，撤回预览缓存使用相同的旧版偏移。
+- `NativeFeatures.mm` 实现静默模式和 `XAppUpdateManager` 的八个 Objective-C 方法替换。原 IMP 全部保留，关闭屏蔽后调用原逻辑；同时控制现有 `SPUUpdater` 的自动检查/下载开关，并在关闭时恢复快照。已启动的更新不作撤销。配置位于 `WeChatAntiRecall_NativeOptions`，主队列每秒读取。
+- runtime 在自身数据缓存下按 bundle ID 写 `session.json`，包含 PID、启动时间 token、构建号和已初始化的组件标记。共享目标 `WeChatRuntimeSession` 会验证主进程完整路径及 PID/start token，防止退出后、PID 重用或切换微信后误判。CLI 的功能开关与 GUI 都识别外置注入状态，不再要求 App 内存在 dylib。
+- 红包组件标记提升到 `WeChatAntiRecallRedPacket:10`。268602 的新 Profile 独立核对九处指纹；Message 576 字节、display 744 字节（沿用 848 字节缓冲区作为上界），任务/订阅仍为 56/40 字节。只有服务 Profile 全部匹配才在会话中发布红包功能标记。
+- 插件暂存路径按内容 SHA-256 固定，重复点击不会为同一版本生成新的 dylib 镜像。副本使用独立 bundle ID 的普通用户缓存；原版仍使用微信容器缓存。
+
+## 4.2.0 / 270353 更新适配
+
+已基于更新后核心库重新定位撤回解析、消息终结器及红包 Profile，详情见 [native-270353.md](Docs/native-270353.md)。当前原生支持表由 `WeChatRuntimeSession.supportedBuilds` 统一管理。270353 已无前置派发桩，使用严格校验后的单指令原子 B 和近距离跳转页，不使用旧的三指令静态入口重写。CLI、GUI、自定义提示和动态选项均识别该构建，无需在静态补丁目录伪造支持条目。红包组件标记更新为 `:11`。不运行测试或业务操作，编译及打包结果不能替代用户端真实注入确认。
+
+270353 的入口安装已修正为两阶段控制器写入：runtime 只准备近跳转页及入口计划，外部 CLI 暂停目标后按 RW→原权限写入，恢复目标，再由 runtime 复核并提交状态。不在活动微信内部请求现有代码页 RWX；分配按完整近分支范围内的 VM 空隙查找，详细错误经共享控制块返回。详见 `Docs/native-270353.md` 的 -17 诊断记录。

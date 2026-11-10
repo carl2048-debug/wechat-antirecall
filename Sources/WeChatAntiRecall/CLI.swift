@@ -619,6 +619,19 @@ struct CLI {
             try versions(rest)
         case "install", "patch":
             try install(rest)
+        case "launch":
+            let options = try DynamicLaunchOptions(rest)
+            let app = try readAppInfo(appPath: options.appPath)
+            try DynamicLauncher.launch(app: app, options: options)
+        case "native-options":
+            var arguments = rest
+            var appPath = defaultAppPath
+            if let index = arguments.firstIndex(of: "--app") {
+                guard index + 1 < arguments.count else { throw ToolError.usage("--app 需要路径") }
+                appPath = arguments[index + 1]
+                arguments.removeSubrange(index...(index + 1))
+            }
+            JSONOutput.emit(try nativeOptions(app: readAppInfo(appPath: appPath), arguments: arguments))
         case "clone":
             try clone(rest)
         case "restore":
@@ -856,15 +869,14 @@ struct CLI {
         let info = try readAppInfo(appPath: options.appPath)
         let store = RedPacketPreferenceStore(
             preferences: RecallTipPreferenceStore(domain: info.bundleIdentifier))
-        let runtimeData = try? Data(contentsOf: info.appURL.appendingPathComponent(RuntimeTipInstaller.destinationDylibPath), options: .mappedIfSafe)
-        let runtimeAvailable = runtimeData?.range(of: Data(RedPacketSettings.runtimeMarker.utf8)) != nil
+        let runtimeAvailable = runtimeComponentAvailable(info: info, marker: RedPacketSettings.runtimeMarker)
         var settings = options.enabled == false ? ((try? store.load()) ?? RedPacketSettings()) : try store.load()
         if let enabled = options.enabled {
             if enabled && !RedPacketSettings.supportedBuilds.contains(info.buildVersion) {
                 throw ToolError.usage("自动红包暂仅适配微信构建 \(RedPacketSettings.supportedBuilds.sorted().joined(separator: "、"))；当前构建为 \(info.buildVersion)。")
             }
             if enabled && !runtimeAvailable {
-                throw ToolError.usage("请先安装或更新包含红包功能的自定义提示运行时，再开启此设置。")
+                throw ToolError.usage("请先回首页注入或更新包含红包功能的运行组件，再开启此设置。")
             }
             settings.enabled = enabled
             if let delay = options.delayMilliseconds { settings.delayMilliseconds = delay }
@@ -918,16 +930,13 @@ struct CLI {
 
         let store = RecallLogPreferenceStore(
             preferences: RecallTipPreferenceStore(domain: info.bundleIdentifier))
-        let runtimeData = try? Data(
-            contentsOf: info.appURL.appendingPathComponent(RuntimeTipInstaller.destinationDylibPath),
-            options: .mappedIfSafe)
-        let runtimeAvailable = runtimeData?.range(of: Data(RecallLogSettings.runtimeMarker.utf8)) != nil
+        let runtimeAvailable = runtimeComponentAvailable(info: info, marker: RecallLogSettings.runtimeMarker)
         // Turning the log off must stay possible even when the stored value is damaged.
         var settings = options.action == .off ? ((try? store.load()) ?? RecallLogSettings()) : try store.load()
         switch options.action {
         case .on:
             guard runtimeAvailable else {
-                throw ToolError.usage("请先安装或更新包含撤回记录的自定义提示运行时，再开启此设置。")
+                throw ToolError.usage("请先回首页注入或更新包含撤回记录的运行组件，再开启此设置。")
             }
             settings.enabled = true
             try store.save(settings)
@@ -959,10 +968,7 @@ struct CLI {
         let info = try readAppInfo(appPath: options.appPath)
         let store = KeywordAlertPreferenceStore(
             preferences: RecallTipPreferenceStore(domain: info.bundleIdentifier))
-        let runtimeData = try? Data(
-            contentsOf: info.appURL.appendingPathComponent(RuntimeTipInstaller.destinationDylibPath),
-            options: .mappedIfSafe)
-        let runtimeAvailable = runtimeData?.range(of: Data(KeywordAlertSettings.runtimeMarker.utf8)) != nil
+        let runtimeAvailable = runtimeComponentAvailable(info: info, marker: KeywordAlertSettings.runtimeMarker)
         let supported = KeywordAlertSettings.supportedBuilds.contains(info.buildVersion)
         // Turning the alert off must stay possible even when the stored value is damaged.
         var settings = options.action == .off ? ((try? store.load()) ?? KeywordAlertSettings()) : try store.load()
@@ -980,7 +986,7 @@ struct CLI {
                 throw ToolError.usage("关键词提醒暂仅适配微信构建 \(KeywordAlertSettings.supportedBuilds.sorted().joined(separator: "、"))；当前构建为 \(info.buildVersion)。")
             }
             guard runtimeAvailable else {
-                throw ToolError.usage("请先安装或更新包含关键词提醒的自定义提示运行时，再开启此设置。")
+                throw ToolError.usage("请先回首页注入或更新包含关键词提醒的运行组件，再开启此设置。")
             }
             if let keywords = options.keywords { settings.keywords = keywords }
             settings.enabled = true
@@ -1004,10 +1010,7 @@ struct CLI {
         let info = try readAppInfo(appPath: options.appPath)
         let store = WindowPrivacyPreferenceStore(
             preferences: RecallTipPreferenceStore(domain: info.bundleIdentifier))
-        let runtimeData = try? Data(
-            contentsOf: info.appURL.appendingPathComponent(RuntimeTipInstaller.destinationDylibPath),
-            options: .mappedIfSafe)
-        let runtimeAvailable = runtimeData?.range(of: Data(WindowPrivacySettings.runtimeMarker.utf8)) != nil
+        let runtimeAvailable = runtimeComponentAvailable(info: info, marker: WindowPrivacySettings.runtimeMarker)
         // Turning the setting off must stay possible even when the stored value is damaged.
         var settings = options.action == .off ? ((try? store.load()) ?? WindowPrivacySettings()) : try store.load()
         switch options.action {
@@ -1018,7 +1021,7 @@ struct CLI {
             try store.save(settings)
         case .on:
             guard runtimeAvailable else {
-                throw ToolError.usage("请先安装或更新包含窗口隐私的自定义提示运行时，再开启此设置。")
+                throw ToolError.usage("请先回首页注入或更新包含窗口隐私的运行组件，再开启此设置。")
             }
             settings.enabled = true
             try store.save(settings)
@@ -1163,6 +1166,7 @@ struct CLI {
 
         Usage:
           wechat-antirecall versions [--app /Applications/WeChat.app] [--config patches.json] [--json]
+          wechat-antirecall launch [--app /Applications/WeChat.app] --runtime-dylib <path>
           wechat-antirecall install  [--app /Applications/WeChat.app] [--config patches.json] [--with-tip (deprecated, prefer --runtime-tip)] [--runtime-tip] [--runtime-dylib <path>] [--multi-instance] [--block-update] [--update-only] [--dry-run] [--no-backup] [--skip-resign] [--json]
           wechat-antirecall clone    [--app /Applications/WeChat.app] [--output-dir /Applications] [--count 2] [--name-prefix WeChat] [--keep-url-schemes] [--replace] [--dry-run] [--skip-resign] [--json]
           wechat-antirecall restore  --backup <path> [--binary Contents/MacOS/WeChat] [--app /Applications/WeChat.app] [--skip-resign]

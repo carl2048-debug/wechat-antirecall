@@ -106,7 +106,7 @@ final class RedPacketTests: XCTestCase {
     func testRuntimeMarkerMatchesRuntimeExport() {
         XCTAssertEqual(String(cString: wechat_antirecall_red_packet_runtime_version()),
                        RedPacketSettings.runtimeMarker)
-        XCTAssertEqual(RedPacketSettings.runtimeMarker, "WeChatAntiRecallRedPacket:9",
+        XCTAssertEqual(RedPacketSettings.runtimeMarker, "WeChatAntiRecallRedPacket:11",
                        "270135 needs the new native address table; older runtimes must require an update")
     }
 

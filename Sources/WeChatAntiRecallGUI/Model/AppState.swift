@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import WeChatRuntimeSession
 
 @MainActor
 final class AppState: ObservableObject {
@@ -69,9 +70,16 @@ final class AppState: ObservableObject {
         versions?.app.marketingVersion ?? directInfo?.marketingVersion ?? "—"
     }
 
-    var runtimeTipSupported: Bool { versions?.runtimeTipSupported ?? false }
+    var nativeRuntimeSession: NativeRuntimeSession? {
+        NativeRuntimeSession.read(appURL: URL(fileURLWithPath: appPath))
+    }
+    var nativeRuntimeActive: Bool { nativeRuntimeSession != nil }
+    var isNativeBuild: Bool { NativeRuntimeSession.supportedBuilds.contains(displayBuild) }
+
+    var runtimeTipSupported: Bool { isNativeBuild || (versions?.runtimeTipSupported ?? false) }
     var silentAvailable: Bool { versions?.features.silent ?? false }
     var customTipAvailable: Bool {
+        if isNativeBuild { return true }
         guard let versions else { return false }
         return versions.runtimeTipSupported && versions.features.customTip && versions.features.tip
     }
@@ -528,6 +536,40 @@ final class AppState: ObservableObject {
 
     /// The one-click flow: verify WeChat is quit, dry-run to confirm every byte matches,
     /// then elevate for the real install. Any byte mismatch aborts before touching the app.
+    func launchDynamically() async {
+        guard !busy else { return }
+        busy = true
+        busyMessage = "正在注入微信…"
+        banner = nil
+        defer { busy = false; busyMessage = "" }
+        if !WeChatStatusProbe.isRunning(appPath: appPath) {
+            let opened = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: appPath),
+                    configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                    continuation.resume(returning: error == nil)
+                }
+            }
+            guard opened else {
+                banner = Banner(kind: .error, title: "无法打开微信", message: "请先手动打开目标微信，再点击注入。")
+                return
+            }
+        }
+        let runtime: URL
+        do {
+            runtime = try RuntimeStaging.stage(source: BundledPaths.runtimeDylib, appPath: appPath)
+        } catch {
+            banner = Banner(kind: .error, title: "插件准备失败", message: error.localizedDescription)
+            return
+        }
+        let result = await CLIRunner.runAdmin(BundledPaths.cli, [
+            "launch", "--app", appPath, "--runtime-dylib", runtime.path
+        ], operation: "native-inject")
+        appendLog(result.output + result.stderr)
+        banner = result.succeeded
+            ? Banner(kind: .success, title: "动态 Hook 已验证", message: "微信 App 文件未修改。退出微信后失效。")
+            : Banner(kind: .error, title: "注入失败", message: friendlyFailure(result))
+    }
+
     func install(_ request: InstallRequest, refreshRuntime: Bool = false) async {
         guard !busy else { return }
         banner = nil

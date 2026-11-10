@@ -29,16 +29,22 @@ struct AdvancedInstallView: View {
 
             if let banner = state.banner { BannerView(banner: banner) }
 
-            if !supported {
+            if !supported && !state.isNativeBuild {
                 Card {
                     HintRow(systemImage: "info.circle",
                             text: "请先在「首页」确认当前微信版本受支持。不支持时可到「检查更新」拉取最新补丁数据。")
                 }
             }
 
+            if state.isNativeBuild {
+                NativeOptionsView()
+                Text("当前版本使用首页的原生动态注入。静态安装表与本机核心库不匹配，因此不提供静态安装操作。")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
             modeCard
             optionsCard
             actionCard
+            }
         }
         .onChange(of: mode) { newMode in
             if newMode == .updateOnly { blockUpdate = false; multiInstance = false }

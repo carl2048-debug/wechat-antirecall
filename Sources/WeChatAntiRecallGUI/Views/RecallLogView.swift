@@ -7,7 +7,7 @@ struct RecallLogView: View {
     @State private var confirmingClear = false
 
     private var runtimeInstalled: Bool {
-        controller.runtimeAvailable && state.installedMode == .customTip && state.installState == .installed
+        controller.runtimeAvailable && (state.nativeRuntimeActive || (state.installedMode == .customTip && state.installState == .installed))
     }
 
     private static let timeFormatter: DateFormatter = {
@@ -67,17 +67,18 @@ struct RecallLogView: View {
                 .toggleStyle(.switch)
                 .disabled(controller.busy || state.busy || (!controller.enabled && !runtimeInstalled))
                 if !runtimeInstalled && controller.error == nil && !controller.busy {
-                    Text("需要更新本工具的运行组件，并使用自定义撤回提示模式。安装前请完全退出微信。")
+                    Text("需要先加载运行组件。当前原生注入版本请回首页注入，无需修改微信 App。")
                         .font(.callout).foregroundStyle(.secondary)
                     Button(controller.runtimeAvailable ? "安装运行组件" : "安装或更新运行组件") {
                         Task {
-                            await state.install(InstallRequest(mode: .customTip), refreshRuntime: true)
+                            if state.isNativeBuild { await state.launchDynamically() }
+                            else { await state.install(InstallRequest(mode: .customTip), refreshRuntime: true) }
                             await controller.load(appPath: state.appPath)
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(state.busy || controller.busy || state.wechatRunning || !state.customTipAvailable)
-                    if state.wechatRunning {
+                    .disabled(state.busy || controller.busy || (!state.isNativeBuild && (state.wechatRunning || !state.customTipAvailable)))
+                    if state.wechatRunning && !state.isNativeBuild {
                         Button("退出微信") { Task { await state.quitWeChat() } }.disabled(state.busy)
                     }
                 }
